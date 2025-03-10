@@ -1,0 +1,128 @@
+#include <SPI.h>
+#include <EEPROM.h>
+#include <SCServo.h>
+ 
+// UART pins for servo control
+#define S_RXD 33
+#define S_TXD 32
+ 
+// Define SPI commands
+const byte minAFCommand = 0x05;
+const byte maxAFCommand = 0x06;
+ 
+// Helper function to send SPI command
+void SPIWrite(byte cmd) {
+  SPI.transfer(cmd);
+  delayMicroseconds(500);
+}
+ 
+// Function to send a response as JSON
+void sendResponse(String command, String status, String details = "") {
+  // Format the response as JSON
+  Serial.print("{\"command\":\"");
+  Serial.print(command);
+  Serial.print("\",\"status\":\"");
+  Serial.print(status);
+  Serial.print("\",\"details\":\"");
+  Serial.print(details);
+  Serial.println("\"}");
+}
+ 
+void setup() {
+  Serial.begin(115200);       // Initialize serial communication for USB
+  Serial2.begin(115200, SERIAL_8N1, 16, 17);  // Initialize Serial2 for external communication (TX: 16, RX: 17)
+ 
+  // UART for servo control
+  Serial1.begin(1000000, SERIAL_8N1, S_RXD, S_TXD);
+ 
+  SPI.begin();
+  SPI.setBitOrder(MSBFIRST);
+  SPI.setDataMode(SPI_MODE3);
+  SPI.setClockDivider(SPI_CLOCK_DIV128);
+  delay(100);
+  SPIWrite(0x4F); // Initial SPI setup commands
+  delay(100);
+  SPIWrite(0x50);
+  delay(100);
+ 
+  Serial.println("Setup complete");
+}
+ 
+void loop() {
+  SPI.setBitOrder(MSBFIRST);
+  SPI.setDataMode(SPI_MODE3);
+  SPI.setClockDivider(SPI_CLOCK_DIV128);
+ 
+  // Check if data is available on Serial or Serial2
+  if (Serial.available() > 0 || Serial2.available() > 0) {
+    String cmd;
+    if (Serial.available() > 0) {
+      cmd = Serial.readStringUntil('\n');        // Read command from Serial (USB)
+      cmd.trim();                                // Remove any leading/trailing whitespace
+    }
+ 
+    // Process the command
+    if (cmd == "af_min") {
+      SPIWrite(minAFCommand);     // Turn focus ring to AF min
+      sendResponse(cmd, "success", "Focus set to minimum");
+    }
+    else if (cmd == "af_max") {
+      SPIWrite(maxAFCommand);     // Turn focus ring to AF max
+      sendResponse(cmd, "success", "Focus set to maximum");
+    }
+    else if (cmd == "ap_o") {     // Aperture opening
+      SPIWrite(0x07);
+      SPIWrite(0x13);
+      SPIWrite(0xFF);
+      sendResponse(cmd, "success", "Aperture opened");
+    }
+    else if (cmd == "ap_c") {     // Aperture closing
+      SPIWrite(0x07);
+      SPIWrite(0x13);
+      SPIWrite(0x01);
+
+      sendResponse(cmd, "success", "Aperture closed");
+    }
+    else if (cmd == "af_in") {    // Focus inwards
+      for (int i = 1; i <= 6; i++) {  // Repeat the command 3 times
+        SPIWrite(0x44); // Send the SPI command
+        SPIWrite(0x00);
+        sendResponse(cmd, "success", "Focus moved inwards - Step " + String(i));
+        delay(50); // Optional: Small delay between commands
+      }
+    }
+    else if (cmd == "af_out") {   // Focus outwards
+      for (int i = 1; i <= 2; i++) {  // Repeat the command 2 times
+        SPIWrite(0x44); // Send the SPI command
+        SPIWrite(0xFF);
+        sendResponse(cmd, "success", "Focus moved outwards - Step " + String(i));
+        delay(50); // Optional: Small delay between commands
+      }
+    }
+    else if (cmd == "af_in_tiny") {  // Move inwards tiny steps
+      for (int i = 1; i <= 2; i++) {  // Repeat the command 3 times
+        SPIWrite(0x44);
+        SPIWrite(0x00);
+        SPIWrite(((0x02 << 1) ^ 0x00) | 0x01);
+        sendResponse(cmd, "success", "Focus moved in tiny steps - Step " + String(i));
+        delay(50); // Optional: Small delay between commands
+      }
+    }
+    else if (cmd == "af_out_tiny") { // Move outwards tiny steps
+      for (int i = 1; i <= 2; i++) {  // Repeat the command 2 times
+        SPIWrite(0x44);
+        SPIWrite(0xFF);
+        SPIWrite(((0x02 << 1) ^ 0xFF) | 0x01);
+        sendResponse(cmd, "success", "Focus moved out in tiny steps - Step " + String(i));
+        delay(50); // Optional: Small delay between commands
+      }
+    }
+    else if (cmd == "reset") { // Reset the device
+      esp_restart();
+      sendResponse(cmd, "success", "Device restarted");
+    }
+    // else {
+    //   sendResponse(cmd, "error", "Unknown command");
+    // }
+  }
+}
