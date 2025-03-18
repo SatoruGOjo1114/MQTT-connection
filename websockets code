@@ -1,0 +1,708 @@
+#include <Arduino.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiClientSecure.h>   //last update_13.11.24......
+#include <ArduinoJson.h>
+#include <TimeLib.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+#include <Adafruit_MPU6050.h>
+#include "mqtt_connect.h"
+#include "config_file.h"
+
+#define NTP_OFFSET 19800
+#define NTP_INTERVAL 60000
+
+float rashDriving = 0.0;
+float velocity = 0.0; // Initial velocity in m/s
+unsigned long previousTime = 0;
+float movement_value;
+float movement_value_move;
+float brain= 0.0;
+float latitude_val = 0.004;
+float longitude_val = 0.006;
+float lati_val = 0.004;
+float longi_val = 0.006;
+int rashDrivingCount = 0;
+const unsigned long wifiTimeout = 15000;  // 15 seconds timeout
+bool rashDrivingEvent = false; // Tracks if the condition has been counted
+
+
+TinyGPSPlus gps;
+const int rxPin = 20;
+const int txPin = 21;
+SoftwareSerial gpsSerial(rxPin, txPin);
+
+Adafruit_MPU6050 mpu;
+Adafruit_Sensor *mpu_accel;
+
+float lastAccelX = 0.0, lastAccelY = 0.0, lastAccelZ = 0.0;
+const float motionThreshold = 1.0;
+const float accelerationThreshold =  13.0;  // acceleration magnitude (in m/s²)
+const unsigned long rashDrivingTimeThreshold = 20000;
+
+WiFiClientSecure wiFiClient;
+WebSocketClient mqttclient_y(wiFiClient, host, port);
+mqtt_connection_y mqtt_connect_client_y(mqttclient_y, path);
+PubSubClient client(mqtt_connect_client_y);
+
+String currentFormattedTime;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", NTP_OFFSET, NTP_INTERVAL);
+String formattedDate, dayStamp, timeStamp;
+
+unsigned long previousMillis = 0;
+const unsigned long interval = 10000;
+
+float calculateAccelerationMagnitude(sensors_event_t accel);
+
+void setup() {
+   Serial.begin(115200);
+    Wire.begin(6, 7);  // Use default pins for I2C (SDA = GPIO21, SCL = GPIO22)
+    while (!Serial)
+        delay(10);
+    Serial.println("Adafruit MPU6050 Motion Detection & GPS Data");
+
+     //Run I2C scanner to check for connected devices
+    scanI2CDevices();
+
+    initializeMPU();
+    gpsSerial.begin(9600);
+    detectMotion();
+    Serial.println("GPS Serial Communication Started. Waiting for data...");
+    connectToWiFi();
+
+    wiFiClient.setInsecure();
+    timeClient.begin();
+    timeClient.update();
+
+    Serial.println("Setup completed.");
+}
+
+void scanI2CDevices() {
+    byte error, address;
+    int nDevices = 0;
+
+    Serial.println("Scanning for I2C devices...");
+    for (address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        error = Wire.endTransmission();
+        if (error == 0) {
+            Serial.print("I2C device found at address 0x");
+            if (address < 16)
+                Serial.print("0");
+            Serial.print(address, HEX);
+            Serial.println(" !");
+            nDevices++;
+        } else if (error == 4) {
+            Serial.print("Unknown error at address 0x");
+            if (address < 16)
+                Serial.print("0");
+            Serial.println(address, HEX);
+        }
+    }
+    if (nDevices == 0)
+        Serial.println("No I2C devices found\n");
+    else
+        Serial.println("done\n");
+}
+
+void connectToWiFi() {
+    Serial.print("Connecting to ");
+    Serial.println(ssid);
+    WiFi.begin(ssid, password);
+
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < 15000) {  // 15 seconds timeout
+        delay(500);
+        Serial.print(".");
+    }
+
+    StaticJsonDocument<1024> jsonDoc32;  // Define the JSON document
+    String jsonBuffer;  // String to hold serialized JSON
+
+    if (WiFi.status() == WL_CONNECTED) {
+        // WiFi connected
+        Serial.println("\nWiFi connected.");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+
+        // Add data to the JSON document
+        jsonDoc32["time"] = currentFormattedTime;
+        jsonDoc32["iid"] = jsonIid;
+        jsonDoc32["key"] = Wifi_S_key;
+        jsonDoc32["value"] = 1;
+
+        // Serialize the JSON document into the jsonBuffer
+        serializeJson(jsonDoc32, jsonBuffer);
+        Serial.println("JSON Data (WiFi Connected): ");
+        Serial.println(jsonBuffer);
+
+    } else {
+        // WiFi connection failed
+        Serial.println("\nFailed to connect to WiFi.");
+
+        // Add fallback data to the JSON document
+        jsonDoc32["time"] = currentFormattedTime;
+        jsonDoc32["iid"] = jsonIid;
+        jsonDoc32["key"] = Wifi_S_key;
+        jsonDoc32["value"] = 0;
+
+        // Serialize the JSON document into the jsonBuffer
+        serializeJson(jsonDoc32, jsonBuffer);
+        Serial.println("JSON Data (WiFi Failed): ");
+        Serial.println(jsonBuffer);
+    }
+}
+void reconnectWiFi() {
+    // Attempt to reconnect to WiFi
+    WiFi.disconnect();  // Ensure clean start
+    WiFi.begin(ssid, password);
+
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < wifiTimeout) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nReconnected to WiFi.");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nReconnection to WiFi failed.");
+    }
+}
+
+void checkMQTTConnection() {
+    if (!client.connected()) {
+        Serial.println("MQTT client not connected. Attempting to reconnect...");
+        reconnect();
+    }
+}
+void reconnect() {
+    while (!client.connected()) {
+        Serial.println("Attempting MQTT connection...");
+        if (client.connect(data_id, mqtt_user, mqtt_password)) {
+            Serial.println("Connected to MQTT broker");
+        } else {
+            Serial.print("Failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" Retrying in 5 seconds...");
+            delay(5000);
+            reconnectWiFi();
+
+        }
+    }
+}
+bool publishWithRetry(const char* topic, const char* payload, int retries = 3) {
+    for (int i = 0; i < retries; i++) {
+        if (client.publish(topic, payload)) {
+            return true;
+        }
+        delay(500);
+    }
+    return false;
+}
+void updateFormattedTime() {
+    // Update the time client
+    timeClient.update();
+
+    // Get the current epoch time
+    unsigned long epochTime = timeClient.getEpochTime();
+
+    // Set the time using TimeLib's setTime function
+    setTime(epochTime);
+
+    // Format the date and time
+    char formattedTimeBuffer[30];
+    snprintf(formattedTimeBuffer, sizeof(formattedTimeBuffer), "%04d-%02d-%02d %02d:%02d:%02d+05:30", // Fixed offset formatting
+             year(), month(), day(), hour(), minute(), second());
+             
+    // Store the formatted time in a global variable
+    currentFormattedTime = String(formattedTimeBuffer);
+
+    // Debug output
+    Serial.println("Formatted Date and Time: " + currentFormattedTime);
+}
+
+/*void updateFormattedTime() {
+    timeClient.update();
+    formattedDate = timeClient.getFormattedTime();
+    int splitT = formattedDate.indexOf("T");
+    dayStamp = formattedDate.substring(0, splitT);
+    timeStamp = formattedDate.substring(splitT + 1, formattedDate.length() - 1);
+    currentFormattedTime = dayStamp + " " + timeStamp + " +05:30";
+}*/
+void initializeMPU() {
+    if (!mpu.begin()) {
+        Serial.println("Failed to find MPU6050 chip");
+        while (1) {
+            delay(10);
+        }
+    }
+
+    Serial.println("MPU6050 Found!");
+    mpu_accel = mpu.getAccelerometerSensor();
+    mpu_accel->printSensorDetails();
+
+    readAccelerometer(&lastAccelX, &lastAccelY, &lastAccelZ);
+}
+
+void readAccelerometer(float *accelX, float *accelY, float *accelZ) {
+    sensors_event_t accel;
+    mpu_accel->getEvent(&accel);
+    *accelX = accel.acceleration.x;
+    *accelY = accel.acceleration.y;
+    *accelZ = accel.acceleration.z;
+  // Serial.print(" | Acc Z: "); Serial.println(currentAccelZ);
+}
+
+
+float calculateDeltaMagnitude(float deltaX, float deltaY, float deltaZ) {
+    return sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
+}
+
+float detectMotion() {
+    float currentAccelX, currentAccelY, currentAccelZ;
+    readAccelerometer(&currentAccelX, &currentAccelY, &currentAccelZ);
+    Serial.print(" | before Acc Z: "); Serial.println(currentAccelZ);
+    float deltaX = currentAccelX - lastAccelX;
+    float deltaY = currentAccelY - lastAccelY;
+    float deltaZ = currentAccelZ - lastAccelZ;
+    currentAccelZ = currentAccelZ - 9.8 ; // Remove Gravity by adding 
+
+    Serial.print("Acc X: "); Serial.print(currentAccelX);
+    Serial.print(" | Acc Y: "); Serial.print(currentAccelY);
+    Serial.print(" | Acc Z: "); Serial.println(currentAccelZ);
+    Serial.print(" | Delta Z: "); Serial.println(deltaZ);
+    Serial.print(" | Delta Y: "); Serial.println(deltaY);
+
+
+    float deltaMagnitude = calculateDeltaMagnitude(deltaX, deltaY, deltaZ);
+    Serial.print(" | Delta magnitude : "); Serial.println(deltaMagnitude);
+
+
+    StaticJsonDocument<1024> jsonDoc1;
+    jsonDoc1["time"] = currentFormattedTime;
+    jsonDoc1["iid"] = jsonIid;
+    jsonDoc1["key"] = motion_detect;
+   // jsonDoc1["time"] = currentFormattedTime;
+
+    // Check for motion
+    if (deltaMagnitude > motionThreshold) //2
+     {
+        Serial.println("Motion Detected: 1");
+        movement_value = 1;
+        jsonDoc1["value"] = movement_value;
+
+        char jsonBuffer[1024];
+        serializeJson(jsonDoc1, jsonBuffer);
+        client.publish(motion_detection_topic, jsonBuffer);
+        //delay(1000);
+        Serial.println("Motion data sent successfully-----------> 1 ");
+
+        // Update the last accelerometer values
+        lastAccelX = currentAccelX;
+        lastAccelY = currentAccelY;
+        lastAccelZ = currentAccelZ;
+
+        // Check for rash driving
+        sensors_event_t accel;
+        mpu_accel->getEvent(&accel);
+
+        float accelerationMagnitude = calculateAccelerationMagnitude(accel);
+        Serial.print(" | AccLMAg "); Serial.println(accelerationMagnitude);
+      
+
+        if (accelerationMagnitude > accelerationThreshold) { // accleration threshold 15
+            unsigned long startTime = millis();
+            unsigned long rashDrivingDuration = 0;
+            accelerationMagnitude = calculateAccelerationMagnitude(accel);
+                Serial.print(" | AccLMAg "); Serial.println(accelerationMagnitude);
+
+            while (rashDrivingDuration < rashDrivingTimeThreshold) {
+                mpu_accel->getEvent(&accel);
+                accelerationMagnitude = calculateAccelerationMagnitude(accel);
+                Serial.print(" | AccLMAg "); Serial.println(accelerationMagnitude);
+
+                if (accelerationMagnitude > motionThreshold) { //motion threshold =1
+                    rashDrivingDuration = millis() - startTime;
+                    movement_value = 2;
+                    Serial.println("Rash Driving Detected: 2");
+                    //rashDrivingCount++;  
+                    //publishRashDrivingCount();  //Counter to track rash drving how much time happened
+                    // Update JSON document for rash driving*/
+                    jsonDoc1["value"] = 2;
+                    serializeJson(jsonDoc1, jsonBuffer);
+                   // delay(1000);
+                    client.publish(motion_detection_topic, jsonBuffer);
+                    Serial.println("Serialized JSON:");
+                    Serial.println("Motion data sent successfully-----------> 2 ");
+
+                    // Return rash driving value
+                    return 2;
+                }
+                delay(10);    
+            }
+            delay(10);
+        }
+       return 1; // Motion detected but not rash driving
+    } else {
+    Serial.println("Motion Detected: 0");
+    movement_value = 0; // Reset movement_value to 0
+    Serial.print(" | Updated movement_value: "); Serial.println(movement_value);
+
+    // Publish no-motion JSON
+    StaticJsonDocument<256> jsonDoc1;
+    jsonDoc1["time"] = currentFormattedTime;
+    jsonDoc1["iid"] = jsonIid;
+    jsonDoc1["key"] = motion_detect;
+    jsonDoc1["value"] = movement_value;
+
+    char jsonBuffer[256];
+    serializeJson(jsonDoc1, jsonBuffer);
+    client.publish(motion_detection_topic, jsonBuffer);
+
+    Serial.println("Motion data sent successfully: 0");
+
+    // Update the last accelerometer values
+    lastAccelX = currentAccelX;
+    lastAccelY = currentAccelY;
+    lastAccelZ = currentAccelZ;
+
+    return 0; // No motion detected
+}
+
+    
+}
+float calculateAccelerationMagnitude(sensors_event_t accel) {
+    // Subtract gravity from the Z-axis
+    float correctedZ = accel.acceleration.z - 9.8;
+    
+
+    // Calculate the magnitude
+    float magnitude = sqrt(accel.acceleration.x * accel.acceleration.x +
+                           accel.acceleration.y * accel.acceleration.y);
+
+    float magnitudeInKmPerSecSquared = magnitude / 1;
+
+    // Print the acceleration in km/s²
+    Serial.print(" | Acceleration (km/s²): ");
+    Serial.println(magnitudeInKmPerSecSquared, 6); // Print with 6 decimal places
+
+    return magnitudeInKmPerSecSquared;
+}
+
+
+void publishMagnitude(sensors_event_t accel) {
+  // Correct the Z-axis acceleration to account for gravity
+  float correctedZ = accel.acceleration.z - 9.8;
+ // Serial.print(" |correctedZ: ");
+  //Serial.println(correctedZ);
+
+  // Calculate the magnitude of the 3D acceleration
+  float magnitude = sqrt(accel.acceleration.x * accel.acceleration.x +
+                         accel.acceleration.y * accel.acceleration.y);
+  Serial.print(" | movement_value...pbM: ");
+  Serial.println(movement_value);
+
+  // Convert magnitude to km/s² (or the desired unit)
+  
+  //Serial.print(" |correctedZ: ");
+  //Serial.println(correctedZ);
+  Serial.print(" |magnitude_Log publish: ");
+  Serial.println(magnitude);
+
+  // Declare jsonBuffer outside the if-else block to make it accessible to both branches
+  char jsonBuffer[1024];
+
+  // Proceed only if magnitude is greater than 0
+  if ((magnitude > 0) && (movement_value >= 1))  {
+    // Create a JSON document to hold the data
+    StaticJsonDocument<1024> jsonDoc6;
+    magnitude= magnitude-1.5;
+
+    // Check if movement_value > 0 to send the actual data or 0 if not
+    if ((magnitude > 1) && (movement_value >= 1)) {
+      jsonDoc6["time"] = currentFormattedTime;
+      jsonDoc6["iid"] = jsonIid;
+      jsonDoc6["key"] = mag_key;
+      jsonDoc6["value"] = magnitude;
+
+      // Serialize the JSON document into the jsonBuffer
+      serializeJson(jsonDoc6, jsonBuffer);
+
+      // Print the serialized JSON for debugging
+      Serial.print("Publishing to topic: ");
+      Serial.println(magnitude_topic);
+      Serial.print("Payload: ");
+      Serial.println(jsonBuffer);
+      Serial.println("Serialized JSON:");
+      
+    } else {
+      // If movement_value is 0 or less, send a default value of 0
+      jsonDoc6["time"] = currentFormattedTime;
+      jsonDoc6["iid"] = jsonIid;
+      jsonDoc6["key"] = mag_key;
+      jsonDoc6["value"] = 0;
+
+      // Serialize the JSON document into the jsonBuffer
+      serializeJson(jsonDoc6, jsonBuffer);
+
+      // Print the serialized JSON for debugging
+      Serial.print("Publishing to topic: ");
+      Serial.println(magnitude_topic);
+      Serial.print("Payload: ");
+      Serial.println(jsonBuffer);
+      Serial.println("Serialized JSON:");
+    }
+
+    // Measure the JSON size for debugging
+    size_t jsonSize = measureJson(jsonDoc6);
+    Serial.print("JSON size: ");
+    Serial.println(jsonSize);
+
+    // Ensure MQTT connection is active
+    checkMQTTConnection();
+
+    // Attempt to publish with retries
+    if (publishWithRetry(magnitude_topic, jsonBuffer)) {
+        Serial.println("Magnitude data published successfully.");
+    } else {
+        Serial.println("Failed to publish magnitude data after retries.");
+    }
+  }
+}
+
+
+float logRashDriveData() {
+    static bool rashDrivingEvent = false; // Track if rash driving is already logged
+
+    // Check for rash driving
+    if (movement_value > 1) {
+        if (!rashDrivingEvent) {
+            rashDrivingEvent = true; // Mark event as logged
+            rashDrivingCount++;
+
+            // Prepare and publish rash driving data
+            StaticJsonDocument<512> jsonDoc2;
+            jsonDoc2["time"] = currentFormattedTime;
+            jsonDoc2["iid"] = jsonIid1;
+            jsonDoc2["key"] = rash_key;
+            jsonDoc2["value"] = rashDrivingCount;
+
+            char jsonBuffer[512];
+            serializeJson(jsonDoc2, jsonBuffer);
+            Serial.println("Publishing Rash Driving Data...");
+            publishToMQTT(rash_drive_topic, jsonBuffer);
+        }
+
+        // Calculate magnitude
+        sensors_event_t accel;
+        mpu_accel->getEvent(&accel);
+
+        float correctedZ1 = accel.acceleration.z - 9.8;
+        float magnitud = sqrt(accel.acceleration.x * accel.acceleration.x +
+                              accel.acceleration.y * accel.acceleration.y +
+                              correctedZ1 * correctedZ1);
+
+        // Publish magnitude
+        StaticJsonDocument<512> jsonDoc5;
+        jsonDoc5["time"] = currentFormattedTime;
+        jsonDoc5["iid"] = jsonIid1;
+        jsonDoc5["key"] = mag_key1;
+        jsonDoc5["value"] = magnitud;
+
+        char jsonBuffer[512];
+        serializeJson(jsonDoc5, jsonBuffer);
+        Serial.println("Publishing Magnitude Data...");
+        publishToMQTT(magnitude_topic1, jsonBuffer);
+
+        // Log GPS data if available
+        logGPSData();
+    } else {
+        rashDrivingEvent = false; // Reset event if movement drops
+    }
+
+    return movement_value; // Return movement value
+}
+
+
+// Publish to MQTT function for reusability
+void publishToMQTT(const char* topic, const char* payload) {
+    if (client.connected()) {
+        if (client.publish(topic, payload)) {
+            Serial.println("Data published successfully.");
+        } else {
+            Serial.println("Failed to publish data.");
+        }
+    } else {
+        Serial.println("MQTT client not connected. Reconnecting...");
+        checkMQTTConnection();
+    }
+}
+
+// Log GPS Data
+void logGPSData() {
+    while (gpsSerial.available()) {
+        gps.encode(gpsSerial.read());
+    }
+
+    if (gps.location.isValid()) {
+        // Log latitude
+        StaticJsonDocument<512> jsonLat;
+        jsonLat["time"] = currentFormattedTime;
+        jsonLat["iid"] = jsonIid1;
+        jsonLat["key"] = log_lat_key;
+        jsonLat["value"] = gps.location.lat();
+
+        char jsonBuffer[512];
+        serializeJson(jsonLat, jsonBuffer);
+        publishToMQTT(log_latitude_topic, jsonBuffer);
+
+        // Log longitude
+        StaticJsonDocument<512> jsonLng;
+        jsonLng["time"] = currentFormattedTime;
+        jsonLng["iid"] = jsonIid1;
+        jsonLng["key"] = log_lng_key;
+        jsonLng["value"] = gps.location.lng();
+
+        serializeJson(jsonLng, jsonBuffer);
+        publishToMQTT(log_longitude_topic, jsonBuffer);
+    } else {
+        Serial.println("GPS data not valid.");
+    }
+}
+
+
+
+void readGPSData() {
+    while (gpsSerial.available()) {
+        gps.encode(gpsSerial.read());
+    }
+
+    if (gpsSerial.available()) {
+        latitude_val = gps.location.lat();
+        longitude_val = gps.location.lng();
+        Serial.print("GPS Latitude: ");
+        Serial.println(latitude_val, 6);
+        Serial.print("GPS Longitude: ");
+        Serial.println(longitude_val, 6);
+
+        // Publish latitude if it has changed
+        static float lastLatitude = 0.0;
+        if (gps.location.isValid()) {
+            Serial.print("Latitude: ");
+            Serial.println(latitude_val, 6);
+            lastLatitude = latitude_val;
+
+            StaticJsonDocument<1024> jsonDoc3;
+             jsonDoc3["time"] = currentFormattedTime;;
+            jsonDoc3["iid"] = jsonIid;
+            jsonDoc3["key"] = lat_key;
+           //jsonDoc3["time"] = currentFormattedTime;
+            jsonDoc3["value"] = latitude_val;
+
+            char jsonBuffer[1024];
+            serializeJson(jsonDoc3, jsonBuffer);
+            Serial.println("Serialized JSON:");
+            client.publish(latitude_topic, jsonBuffer);
+            delay(1000);
+            Serial.println("Latitude data sent successfully");
+        }
+
+        // Publish longitude if it has changed
+        static float lastLongitude = 0.0;
+        if (gps.location.isValid()) {
+            Serial.print("Longitude: ");
+            Serial.println(longitude_val, 6);
+            lastLongitude = longitude_val;
+
+            StaticJsonDocument<512> jsonDoc4;
+            jsonDoc4["time"] = currentFormattedTime;
+            jsonDoc4["iid"] = jsonIid;
+            jsonDoc4["key"] = lng_key;
+            //jsonDoc4["time"] = currentFormattedTime;
+            jsonDoc4["value"] = longitude_val;
+
+            char jsonBuffer[512];
+            serializeJson(jsonDoc4, jsonBuffer);
+            Serial.println("Serialized JSON:");
+            client.publish(longitude_topic, jsonBuffer);
+            delay(1000);
+            Serial.println("Longitude data sent successfully");
+        }
+    } else {
+        Serial.println("GPS location not valid yet.");
+    }
+
+    if (gps.satellites.value() > 0) {
+        Serial.print("Satellites: ");
+        Serial.println(gps.satellites.value());
+    } else {
+        Serial.println("No satellites found");
+    }
+}
+
+void loop() {
+    unsigned long currentMillis = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        connectToWiFi();
+         reconnectWiFi();
+    }
+
+    if (!client.connected()) {
+        reconnect();
+    } 
+
+    client.loop();
+    //connectToWiFi()
+    updateFormattedTime();
+    readGPSData();
+    detectMotion();
+    // Calculate acceleration magnitude
+    readAccelerometer(&lastAccelX, &lastAccelY, &lastAccelZ);
+    //publishRashDrivingCount();
+    sensors_event_t accel;
+        mpu_accel->getEvent(&accel);
+        calculateAccelerationMagnitude(accel);
+    float magnitude = sqrt(accel.acceleration.x * accel.acceleration.x +
+                           accel.acceleration.y * accel.acceleration.y +
+                           accel.acceleration.z * accel.acceleration.z);
+    //sensors_event_t accel;
+    mpu_accel->getEvent(&accel);
+ // Fetch sensor data
+    publishMagnitude(accel); 
+    logRashDriveData();
+    while (gpsSerial.available()) {
+        char c = gpsSerial.read();
+        gps.encode(c);           // Parse NMEA sentences
+    }
+
+    // Check if speed data is available
+    if (gps.speed.isValid()) {
+        // Print speed in knots, km/h, and mph
+        Serial.print("Speed (knots): ");
+        Serial.println(gps.speed.knots(), 2);
+
+        Serial.print("Speed (km/h): ");
+        Serial.println(gps.speed.kmph(), 2);
+
+        Serial.print("Speed (mph): ");
+        Serial.println(gps.speed.mph(), 2);
+    } else {
+        Serial.println("Speed data not available.");
+    }
+    
+
+    if (currentMillis - previousMillis >= interval) {
+        previousMillis = currentMillis;
+        Serial.println("Interval time reached");
+    }
+
+    delay(2111);
+}
