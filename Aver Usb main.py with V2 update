@@ -1,0 +1,252 @@
+#!/usr/bin/python3
+from capture_usb import Capture
+from time import sleep
+import cv2
+import os
+import serial
+import Jetson.GPIO as GPIO
+from datetime import datetime
+import traceback
+import sys
+import psutil
+import json
+import time
+import shutil
+import socket
+
+def permissions():
+    try:
+        sudoPassword = 'nvidia'
+        command = 'chmod 666 /dev/ttyS0'
+        os.system('echo %s|sudo -S %s' % (sudoPassword, command))
+        sleep(.25)
+    except:
+        pass
+
+def permissions1(path):
+    sudoPassword = 'nvidia'
+    command = 'chmod 666 ' + path
+    os.system('echo %s|sudo -S %s' % (sudoPassword, command))
+    sleep(.25)
+
+def acquire_name(filePath2):
+    names = os.listdir(filePath2)
+    return len(names) + 1 if names else 1
+
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return round(int(f.read()) / 1000.0, 2)
+    except:
+        return None
+
+def get_cpu_usage():
+    return psutil.cpu_percent(interval=0.5)
+
+def check_raspi_camera():
+    try:
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            cap.release()
+            return "connected"
+        else:
+            return "not detected"
+    except:
+        return "not detected"
+
+def main():
+    permissions()
+    permissions1('/dev/ttyUSB0')
+    permissions1('/dev/ttyS0')
+
+    ser = serial.Serial("/dev/ttyS0", 115200, timeout=0.01)
+
+    try:
+        usb_serial = serial.Serial("/dev/ttyUSB0", 115200, timeout=1)
+        usb_available = True
+    except serial.SerialException:
+        print("[WARNING] ESP32-C3 not connected on /dev/ttyUSB0. Continuing without USB.")
+        usb_serial = None
+        usb_available = False
+
+    boot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Send boot message
+    boot_message = {
+        "device": "avermedia_jetson",
+        "status": "booted",
+        "timestamp": boot_time
+    }
+    if usb_available:
+        usb_serial.write((json.dumps(boot_message) + "\n").encode())
+
+    filePath2 = "/home/nvidia/Documents/images/"
+    cam_type = None
+    t1 = None
+
+    # Try USB camera
+    try:
+        t1 = Capture()
+        t1.thread()
+        sleep(1)
+        if t1.cam1_status:
+            cam_type = "usb"
+        else:
+            t1.stop()
+            t1 = None
+    except:
+        t1 = None
+
+    # If USB camera not available, fallback to FFC camera check
+    if not cam_type:
+        ffc_status = check_raspi_camera()
+        if ffc_status == "connected":
+            cam_type = "raspi"
+
+    pin = 13
+    GPIO.cleanup()
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(pin, GPIO.IN)
+
+    name = 0
+    prevCheck = 0
+    last_wroom_time = time.time()
+    esp32_wroom_status = {"status": "offline"}
+
+    while True:
+        try:
+            val = GPIO.input(pin)
+            ser = serial.Serial("/dev/ttyS0", 115200, timeout=0.01)
+
+            stat = 0
+            if cam_type == "usb" and t1:
+                stat = t1.status
+                img = t1.img
+                print(stat, val, "status  valueeeee")
+
+                if t1.cam1_status:
+                    ser.write(b"l2\n")
+                else:
+                    ser.write(b"l3\n")
+
+                if stat == 1 and val == 1:
+                    ser.write(b"r1\n")
+                    sleep(.10)
+                    ser.write(b"l1\n")
+                    sleep(3)
+                    if prevCheck == 0 and stat == 1:
+                        time_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".png"
+                        name += 1
+                        sleep(1)
+
+                if stat == 0 or val == 0:
+                    prevCheck = stat
+                    ser.write(b"r0\n")
+                    sleep(.10)
+                    ser.write(b"l0\n")
+
+                prevCheck = stat
+
+            elif cam_type == "raspi":
+                stat = 1
+                ser.write(b"l2\n")
+                if val == 1:
+                    ser.write(b"r1\n")
+                    sleep(.10)
+                    ser.write(b"l1\n")
+                    sleep(3)
+                if val == 0:
+                    ser.write(b"r0\n")
+                    sleep(.10)
+                    ser.write(b"l0\n")
+            else:
+                stat = 0
+                print("[WARNING] No camera detected")
+
+            if ser.in_waiting:
+                wroom_line = ser.readline().decode().strip()
+                if wroom_line:
+                    try:
+                        esp32_wroom_status = json.loads(wroom_line)
+                        esp32_wroom_status["status"] = "alive"
+                        last_wroom_time = time.time()
+                    except:
+                        pass
+
+            if time.time() - last_wroom_time > 10:
+                esp32_wroom_status = {"status": "offline"}
+
+            # Metrics
+            try:
+                disk = shutil.disk_usage("/")
+                disk_percent = round(disk.used / disk.total * 100, 2)
+            except:
+                disk_percent = None
+
+            try:
+                ram_percent = psutil.virtual_memory().percent
+            except:
+                ram_percent = None
+
+            try:
+                uptime_sec = int(time.time() - psutil.boot_time())
+            except:
+                uptime_sec = None
+
+            try:
+                ip_addr = socket.gethostbyname(socket.gethostname())
+            except:
+                ip_addr = "unknown"
+
+            heartbeat = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "device": "avermedia_jetson",
+                "camera": "connected" if cam_type else "not detected",
+                "cpu": get_cpu_usage(),
+                "temperature": get_cpu_temp(),
+                "memory": ram_percent,
+                "disk": disk_percent,
+                "ip": ip_addr,
+                "uptime": uptime_sec,
+                "jetson_boot_time": boot_time,
+                "jetson_status": "online",
+                "raspi_cam_status": "connected" if cam_type == "raspi" else "not connected",
+                "status": stat,
+                "value": val,
+                "esp32_wroom": esp32_wroom_status
+            }
+
+            if usb_available:
+                usb_serial.write((json.dumps(heartbeat) + "\n").encode())
+
+            print("Sent to ESP32-C3:", heartbeat)
+
+            val = 0
+            ser.flushOutput()
+            ser.flushInput()
+            sleep(5)
+
+        except KeyboardInterrupt:
+            print("error")
+            if t1: t1.stop()
+            ser.write(b"r0\n")
+            sleep(.10)
+            ser.write(b"l0\n")
+            ser.close()
+            if usb_available:
+                usb_serial.close()
+            break
+
+        except Exception:
+            traceback.print_exception(*sys.exc_info())
+            if t1: t1.stop()
+            ser.write(b"r0\n")
+            sleep(.10)
+            ser.write(b"l0\n")
+            ser.close()
+            if usb_available:
+                usb_serial.close()
+            break
+
+if __name__ == '__main__':
+    main()
